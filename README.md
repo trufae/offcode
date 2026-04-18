@@ -38,6 +38,12 @@ ollama pull gemma4:e4b
 
 ## Install
 
+### From cargo
+
+```
+cargo install offcode
+```
+
 ### From source
 
 ```bash

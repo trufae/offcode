@@ -1,9 +1,11 @@
 [package]
 name = "offcode"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["sha0coder"]
 license = "MIT"
+repository = "https://github.com/sha0coder/offcode/"
+documentation = "https://docs.rs/offcode"
 description = "Offline AI coding assistant powered by Ollama"
 
 [[bin]]
