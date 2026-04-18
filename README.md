@@ -1,6 +1,14 @@
 # offcode
 
 
+```
+      ╭──────────╮
+      │  ◉    ◉  │   offcode  model:gemma4:e4b
+      │   ╰──╯   │   offline coding assistant
+      ╰──────────╯   powered by ollama · type a prompt to begin
+```
+
+
 ![Offcode ASCII art](pics/pic2.png)
 
 ## What is this?
