@@ -1,7 +1,7 @@
 # offcode
 
 
-![Offcode ASCII art](pics/pic1.png)
+![Offcode ASCII art](pics/pic2.png)
 
 ## What is this?
 
