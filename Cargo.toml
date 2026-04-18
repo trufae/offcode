@@ -2,6 +2,7 @@
 name = "offcode"
 version = "0.1.0"
 edition = "2021"
+authors = ["sha0coder"]
 description = "Offline AI coding assistant powered by Ollama"
 
 [[bin]]
