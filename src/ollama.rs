@@ -297,6 +297,11 @@ mod tests {
         Client::new("http://localhost:11434")
     }
 
+    fn test_model() -> String {
+        std::env::var("OFFCODE_TEST_MODEL")
+            .unwrap_or_else(|_| crate::config::Config::default().model)
+    }
+
     // If Ollama is not running these tests return early (pass trivially).
     // In CI the integration job installs Ollama so they run for real.
 
@@ -313,7 +318,7 @@ mod tests {
         if !client.is_healthy() { return; }
 
         let request = ChatRequest {
-            model: crate::config::Config::default().model,
+            model: test_model(),
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "Reply with only the word ok".to_string(),
@@ -341,7 +346,7 @@ mod tests {
         std::fs::write(&file, "the answer is 42").unwrap();
 
         let request = ChatRequest {
-            model: crate::config::Config::default().model,
+            model: test_model(),
             messages: vec![Message {
                 role: "user".to_string(),
                 content: format!("Read the file at {} and tell me what it says.", file.display()),

@@ -41,7 +41,9 @@ jobs:
           sleep 5
 
       - name: Pull model
-        run: ollama pull gemma4:e4b
+        run: ollama pull qwen2.5:0.5b
 
       - name: Integration tests
+        env:
+          OFFCODE_TEST_MODEL: qwen2.5:0.5b
         run: cargo test
