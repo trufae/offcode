@@ -22,7 +22,7 @@ Works like Claude Code or OpenCode but talks only to a local Ollama instance but
 ## Features
 
 - **Full TUI** — scrollable chat interface with live streaming output
-- **Tool use** — reads/writes files, runs shell commands, searches code
+- **Tool use** — reads/writes files, runs shell commands, searches code, browses the web, administers remote hosts via SSH
 - **Agentic loop** — chains multiple tool calls autonomously until the task is done
 - **Think support** — shows or hides Qwen3/Deepseek reasoning tokens
 - **Config file** — persistent settings at `~/.config/offcode/config.toml`
@@ -113,6 +113,11 @@ offcode --no-tui
 | `create_dir` | Create directories |
 | `delete_path` | Delete a file or empty directory |
 | `path_info` | File/directory metadata |
+| `ssh_connect` | Open a persistent SSH connection to a remote host |
+| `ssh_exec` | Run a command on the connected SSH host |
+| `ssh_disconnect` | Close the current SSH connection |
+| `web_search` | Search the web via DuckDuckGo (no API key required) |
+| `fetch_url` | Fetch and read any HTTP/HTTPS URL as plain text |
 
 ## Configuration
 

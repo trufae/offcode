@@ -166,6 +166,35 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "web_search",
+                "description": "Search the web using DuckDuckGo. Returns a summary and related results. Use for current events, documentation, news, or any information not in the local codebase.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query":   { "type": "string", "description": "Search query" },
+                        "max_results": { "type": "integer", "description": "Max related results to return (default: 5)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch the content of any HTTP or HTTPS URL. Returns plain text (HTML tags stripped). Use to read documentation, news articles, or any web page found via web_search.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "url": { "type": "string", "description": "Full URL to fetch (http:// or https://)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "ssh_disconnect",
                 "description": "Close the current SSH connection.",
                 "parameters": {
@@ -439,6 +468,46 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
             }
         }
 
+        "fetch_url" => {
+            let url = sarg(&args, "url");
+            if url.is_empty() {
+                return "Error: 'url' is required".to_string();
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return "Error: URL must start with http:// or https://".to_string();
+            }
+            match ureq::get(&url).call() {
+                Ok(resp) => match resp.into_string() {
+                    Ok(body) => strip_html(&body),
+                    Err(e) => format!("Failed to read response: {e}"),
+                },
+                Err(e) => format!("Failed to fetch URL: {e}"),
+            }
+        }
+
+        "web_search" => {
+            let query = sarg(&args, "query");
+            if query.is_empty() {
+                return "Error: 'query' is required".to_string();
+            }
+            let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+            let encoded: String = query
+                .chars()
+                .map(|c| if c == ' ' { '+' } else { c })
+                .collect();
+            let url = format!("https://html.duckduckgo.com/html/?q={encoded}");
+            match ureq::get(&url)
+                .set("User-Agent", "Mozilla/5.0 (compatible; offcode/1.0)")
+                .call()
+            {
+                Ok(resp) => match resp.into_string() {
+                    Ok(body) => parse_ddg_html(&body, max),
+                    Err(e) => format!("Failed to read response: {e}"),
+                },
+                Err(e) => format!("Search request failed: {e}"),
+            }
+        }
+
         _ => format!("Unknown tool '{name}'"),
     }
 }
@@ -457,6 +526,8 @@ pub fn print_list() {
         ("ssh_connect",     "Connect to a remote host via SSH"),
         ("ssh_exec",        "Run a command on the connected SSH host"),
         ("ssh_disconnect",  "Disconnect from the current SSH host"),
+        ("web_search",      "Search the web via DuckDuckGo (no API key needed)"),
+        ("fetch_url",       "Fetch and read any HTTP/HTTPS URL as plain text"),
     ];
     println!("{BOLD}Available tools:{RESET}");
     for (name, desc) in &tools {
@@ -543,6 +614,198 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+fn parse_ddg_html(html: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0;
+    let mut pos = 0;
+
+    while count < max && pos < html.len() {
+        // Find next result title anchor
+        let Some(rel) = html[pos..].find("class=\"result__a\"") else { break };
+        let chunk = &html[pos + rel..];
+
+        // Extract href from the tag (search backwards from class= to opening <a)
+        let tag_start = chunk[..17].rfind('<').unwrap_or(0);
+        let tag = &chunk[tag_start..];
+        let href = extract_attr(tag, "href").unwrap_or_default();
+
+        // Extract title text (between > and </a>)
+        let title = if let Some(gt) = tag.find('>') {
+            let after = &tag[gt + 1..];
+            if let Some(end) = after.find("</a>") {
+                html_text(&after[..end])
+            } else { String::new() }
+        } else { String::new() };
+
+        // Advance past this anchor
+        let end_a = chunk.find("</a>").map(|i| i + 4).unwrap_or(17);
+        pos += rel + end_a;
+
+        // Look for snippet right after (within next 2000 chars)
+        let window = html.get(pos..pos + 2000).unwrap_or("");
+        let snippet = if let Some(snip_pos) = window.find("result__snippet") {
+            let snip = &window[snip_pos..];
+            if let Some(gt) = snip.find('>') {
+                let after = &snip[gt + 1..];
+                if let Some(end) = after.find("</a>") {
+                    html_text(&after[..end])
+                } else { String::new() }
+            } else { String::new() }
+        } else { String::new() };
+
+        if title.is_empty() { continue; }
+
+        out.push_str(&format!("{title}\n"));
+        if !href.is_empty() { out.push_str(&format!("{href}\n")); }
+        if !snippet.is_empty() { out.push_str(&format!("{snippet}\n")); }
+        out.push('\n');
+        count += 1;
+    }
+
+    if out.is_empty() { "No results found.".to_string() } else { out.trim_end().to_string() }
+}
+
+// Extract an HTML attribute value (e.g. href="...") from a tag string.
+// Resolves DDG redirect URLs (?uddg=...) to the real destination.
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')?;
+    let raw = html_text(&tag[start..start + end]);
+
+    // DDG wraps real URLs in //duckduckgo.com/l/?uddg=<percent-encoded-url>&rut=...
+    if raw.contains("duckduckgo.com/l/") {
+        if let Some(uddg_start) = raw.find("uddg=") {
+            let encoded = raw[uddg_start + 5..].split('&').next().unwrap_or("");
+            return Some(percent_decode(encoded));
+        }
+    }
+
+    // Promote protocol-relative URLs
+    if raw.starts_with("//") {
+        return Some(format!("https:{raw}"));
+    }
+
+    Some(raw)
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h1 = chars.next().unwrap_or('0');
+            let h2 = chars.next().unwrap_or('0');
+            if let Ok(byte) = u8::from_str_radix(&format!("{h1}{h2}"), 16) {
+                out.push(byte as char);
+            }
+        } else if c == '+' {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// Strip any remaining tags and decode entities from a short string
+fn html_text(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            '&' if !in_tag => {
+                let mut entity = String::new();
+                for ec in chars.by_ref() {
+                    if ec == ';' { break; }
+                    entity.push(ec);
+                }
+                out.push_str(match entity.as_str() {
+                    "amp" => "&", "lt" => "<", "gt" => ">",
+                    "quot" => "\"", "apos" => "'", "nbsp" => " ",
+                    _ => { out.push('&'); out.push_str(&entity); out.push(';'); continue; }
+                });
+            }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut buf = String::new();
+
+    let mut chars = html.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_tag {
+            buf.push(c);
+            if c == '>' {
+                let tag = buf.to_lowercase();
+                in_script = tag.starts_with("<script") || tag.starts_with("<style");
+                if tag.starts_with("</script") || tag.starts_with("</style") {
+                    in_script = false;
+                }
+                // add newline after block-level closing tags
+                if tag.starts_with("</p") || tag.starts_with("</div")
+                    || tag.starts_with("</li") || tag.starts_with("<br")
+                    || tag.starts_with("</h")
+                {
+                    out.push('\n');
+                }
+                buf.clear();
+                in_tag = false;
+            }
+        } else if c == '<' {
+            in_tag = true;
+            buf.push(c);
+        } else if !in_script {
+            // decode basic HTML entities
+            if c == '&' {
+                let mut entity = String::new();
+                for ec in chars.by_ref() {
+                    if ec == ';' { break; }
+                    entity.push(ec);
+                }
+                let decoded = match entity.as_str() {
+                    "amp"  => "&",
+                    "lt"   => "<",
+                    "gt"   => ">",
+                    "quot" => "\"",
+                    "apos" => "'",
+                    "nbsp" => " ",
+                    _      => { out.push('&'); out.push_str(&entity); out.push(';'); continue; }
+                };
+                out.push_str(decoded);
+            } else {
+                out.push(c);
+            }
+        }
+    }
+
+    // collapse runs of blank lines
+    let mut result = String::new();
+    let mut blank_run = 0u32;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 { result.push('\n'); }
+        } else {
+            blank_run = 0;
+            result.push_str(trimmed);
+            result.push('\n');
+        }
+    }
+    result
 }
 
 fn sarg(args: &Value, key: &str) -> String {
