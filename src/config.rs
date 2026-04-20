@@ -10,9 +10,13 @@ pub struct Config {
     pub num_ctx: u32,
     pub show_thinking: bool,
     pub max_tool_iters: u32,
+    #[serde(default = "default_yolo")]
+    pub yolo: bool,
     #[serde(skip)]
     pub no_ctx: bool,
 }
+
+fn default_yolo() -> bool { false }
 
 impl Default for Config {
     fn default() -> Self {
@@ -34,6 +38,7 @@ impl Default for Config {
             num_ctx: 16384,
             show_thinking: false,
             max_tool_iters: 30,
+            yolo: false,
             no_ctx: false,
         }
     }
