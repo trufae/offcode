@@ -11,6 +11,13 @@ mod ui;
 use config::Config;
 use ollama::{ChatRequest, Client, Message, Options};
 
+pub enum ConfirmAction {
+    Accept,
+    Reject(String),
+    Modify(serde_json::Value),
+    Comment(String),
+}
+
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let mut cfg = Config::load();
@@ -158,6 +165,11 @@ fn run_repl(cfg: Config, client: Client) {
                 println!("{}History cleared.{}", ui::DIM, ui::RESET);
             }
             "/tools" => tools::print_list(),
+            "/yolo" => {
+                cfg.yolo = !cfg.yolo;
+                let state = if cfg.yolo { "on (tools run without prompting)" } else { "off (prompt before each tool call)" };
+                println!("{}Yolo mode: {}{}", ui::DIM, state, ui::RESET);
+            }
             "/config" => {
                 println!("{}", toml::to_string_pretty(&cfg).unwrap_or_default());
             }
@@ -230,53 +242,78 @@ fn run_turn(cfg: &Config, client: &Client, messages: &mut Vec<Message>, input: &
         );
 
         match result {
-            Ok((content, Some(calls))) => {
+            Ok((content, Some(mut calls))) => {
                 println!("{}", ui::RESET);
+
+                // Per-call confirmation: may mutate args on Modify, or produce
+                // a comment appended after the tool result.
+                let mut actions: Vec<ConfirmAction> = Vec::with_capacity(calls.len());
+                for call in calls.iter_mut() {
+                    print_tool_call(&call.function.name, &call.function.arguments);
+                    let action = if cfg.yolo {
+                        ConfirmAction::Accept
+                    } else {
+                        prompt_confirm_stdin()
+                    };
+                    if let ConfirmAction::Modify(ref new_args) = action {
+                        call.function.arguments = new_args.clone();
+                        println!("{}  (args modified){}", ui::DIM, ui::RESET);
+                    }
+                    actions.push(action);
+                }
+
                 messages.push(Message {
                     role: "assistant".to_string(),
                     content: content.clone(),
                     tool_calls: Some(calls.clone()),
                 });
 
-                for call in &calls {
+                for (call, action) in calls.iter().zip(actions.into_iter()) {
                     let name = &call.function.name;
                     let args = &call.function.arguments;
-                    println!(
-                        "\n{}{}⚙ {}{}{}{}",
-                        ui::BOLD,
-                        ui::BRIGHT_YELLOW,
-                        ui::RESET,
-                        ui::CYAN,
-                        name,
-                        ui::RESET
-                    );
-                    if let Some(obj) = args.as_object() {
-                        for (k, v) in obj {
-                            let val = match v {
-                                serde_json::Value::String(s) => {
-                                    let first: String =
-                                        s.lines().next().unwrap_or("").chars().take(80).collect();
-                                    if s.lines().count() > 1 {
-                                        format!("{first}…")
-                                    } else {
-                                        first
-                                    }
-                                }
-                                other => other.to_string(),
+
+                    let (tool_result, extra_user) = match action {
+                        ConfirmAction::Reject(reason) => {
+                            let msg = if reason.is_empty() {
+                                "Tool call rejected by user.".to_string()
+                            } else {
+                                format!("Tool call rejected by user: {reason}")
                             };
-                            println!("  {}  {k}: {}{}", ui::DIM, val, ui::RESET);
+                            println!("{}  ✗ rejected{}", ui::YELLOW, ui::RESET);
+                            (msg, None)
                         }
-                    }
-                    let tool_result = tools::execute(name, args);
-                    let preview: Vec<&str> = tool_result.lines().take(4).collect();
-                    if !preview.is_empty() {
-                        println!("{}  → {}{}", ui::DIM, preview.join(" | "), ui::RESET);
-                    }
+                        ConfirmAction::Comment(text) => {
+                            let r = tools::execute(name, args);
+                            let preview: Vec<&str> = r.lines().take(4).collect();
+                            if !preview.is_empty() {
+                                println!("{}  → {}{}", ui::DIM, preview.join(" | "), ui::RESET);
+                            }
+                            (r, Some(text))
+                        }
+                        ConfirmAction::Accept | ConfirmAction::Modify(_) => {
+                            let r = tools::execute(name, args);
+                            let preview: Vec<&str> = r.lines().take(4).collect();
+                            if !preview.is_empty() {
+                                println!("{}  → {}{}", ui::DIM, preview.join(" | "), ui::RESET);
+                            }
+                            (r, None)
+                        }
+                    };
+
                     messages.push(Message {
                         role: "tool".to_string(),
                         content: tool_result,
                         tool_calls: None,
                     });
+
+                    if let Some(text) = extra_user {
+                        println!("{}  + user note: {}{}", ui::DIM, text, ui::RESET);
+                        messages.push(Message {
+                            role: "user".to_string(),
+                            content: text,
+                            tool_calls: None,
+                        });
+                    }
                 }
                 println!();
             }
@@ -365,6 +402,7 @@ fn print_repl_help() {
     println!("  {c}/model{r}          {d}List available models (with capabilities){r}");
     println!("  {c}/model <name>{r}   {d}Switch model{r}");
     println!("  {c}/config{r}         {d}Show config{r}");
+    println!("  {c}/yolo{r}           {d}Toggle yolo mode (auto-approve tool calls){r}");
     println!("  {c}/exit{r}           {d}Quit{r}");
 }
 
@@ -403,6 +441,91 @@ fn print_model_list(client: &Client, selected: &str) {
         selected,
         ui::RESET
     );
+}
+
+fn print_tool_call(name: &str, args: &serde_json::Value) {
+    println!(
+        "\n{}{}⚙ {}{}{}{}",
+        ui::BOLD,
+        ui::BRIGHT_YELLOW,
+        ui::RESET,
+        ui::CYAN,
+        name,
+        ui::RESET
+    );
+    if let Some(obj) = args.as_object() {
+        for (k, v) in obj {
+            let val = match v {
+                serde_json::Value::String(s) => {
+                    let first: String =
+                        s.lines().next().unwrap_or("").chars().take(80).collect();
+                    if s.lines().count() > 1 {
+                        format!("{first}…")
+                    } else {
+                        first
+                    }
+                }
+                other => other.to_string(),
+            };
+            println!("  {}  {k}: {}{}", ui::DIM, val, ui::RESET);
+        }
+    }
+}
+
+fn prompt_confirm_stdin() -> ConfirmAction {
+    use std::io::BufRead;
+    let stdin = io::stdin();
+    loop {
+        print!(
+            "{}[y]accept  [n]reject  [c <note>]comment  [m <json>]modify ? {}",
+            ui::BRIGHT_GREEN,
+            ui::RESET
+        );
+        io::stdout().flush().ok();
+
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            return ConfirmAction::Reject("stdin closed".into());
+        }
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
+            return ConfirmAction::Accept;
+        }
+        if trimmed.eq_ignore_ascii_case("n") || trimmed.eq_ignore_ascii_case("no") {
+            return ConfirmAction::Reject(String::new());
+        }
+        let (head, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((h, r)) => (h, r.trim()),
+            None => (trimmed, ""),
+        };
+        match head {
+            "r" | "reject" => return ConfirmAction::Reject(rest.to_string()),
+            "c" | "comment" => {
+                if rest.is_empty() {
+                    println!("{}  (comment text required){}", ui::YELLOW, ui::RESET);
+                    continue;
+                }
+                return ConfirmAction::Comment(rest.to_string());
+            }
+            "m" | "modify" => {
+                if rest.is_empty() {
+                    println!("{}  (json args required){}", ui::YELLOW, ui::RESET);
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(rest) {
+                    Ok(v) => return ConfirmAction::Modify(v),
+                    Err(e) => {
+                        println!("{}  invalid JSON: {}{}", ui::YELLOW, e, ui::RESET);
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                println!("{}  unknown response{}", ui::YELLOW, ui::RESET);
+            }
+        }
+    }
 }
 
 fn print_history(messages: &[Message]) {

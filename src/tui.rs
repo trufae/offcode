@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::ollama::{ChatRequest, Client, Message, Options};
 use crate::tools;
+use crate::ConfirmAction;
 
 // ── line editor (input, cursor, history, completion) ─────────────────────────
 
@@ -213,13 +214,17 @@ fn lcp_of(strs: &[String]) -> String {
 
 // ── worker ↔ app events ───────────────────────────────────────────────────────
 
-#[derive(Debug)]
 enum WorkerMsg {
     ThinkToken(String),
     Token(String),
     ToolBegin { name: String, args: Value },
     ToolEnd { result_preview: String },
     AddMessage(Message),
+    ConfirmRequest {
+        name: String,
+        args: Value,
+        reply: mpsc::SyncSender<ConfirmAction>,
+    },
     Done,
     Error(String),
 }
@@ -267,7 +272,7 @@ impl Entry {
 // ── slash commands (used by /help and Tab completion) ────────────────────────
 
 const COMMANDS: &[&str] = &[
-    "/help", "/clear", "/reset", "/tools", "/think",
+    "/help", "/clear", "/reset", "/tools", "/think", "/yolo",
     "/model", "/models", "/exit", "/quit",
 ];
 
@@ -277,6 +282,14 @@ const COMMANDS: &[&str] = &[
 enum Mode {
     Input,
     Generating,
+}
+
+struct PendingConfirm {
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    args: Value,
+    reply: mpsc::SyncSender<ConfirmAction>,
 }
 
 pub struct App {
@@ -295,6 +308,7 @@ pub struct App {
     pub should_quit: bool,
     tick: u64,
     model_names_cache: Option<Vec<String>>,
+    pending_confirm: Option<PendingConfirm>,
 }
 
 impl App {
@@ -321,6 +335,7 @@ impl App {
             queued: None,
             cancel: Arc::new(AtomicBool::new(false)),
             model_names_cache: None,
+            pending_confirm: None,
         }
     }
 
@@ -381,6 +396,11 @@ impl App {
             return;
         }
         if key.code == KeyCode::Esc {
+            if self.pending_confirm.is_some() {
+                // Esc during confirmation → reject with no reason
+                self.deliver_confirm(ConfirmAction::Reject(String::new()));
+                return;
+            }
             match self.mode {
                 Mode::Generating => {
                     // Cancel current generation, stay in app
@@ -429,6 +449,26 @@ impl App {
     // ── submission ────────────────────────────────────────────────────────────
 
     fn submit(&mut self) {
+        // Confirmation mode intercepts everything except slash commands.
+        if self.pending_confirm.is_some() {
+            let text = self.editor.take().unwrap_or_default();
+            if text.starts_with('/') {
+                // Allow slash commands (e.g. /yolo) during confirmation. Re-queue
+                // the editor so the user can retry, then run the command.
+                self.handle_command(&text);
+                return;
+            }
+            let action = parse_confirm_input(&text);
+            match action {
+                Ok(a) => self.deliver_confirm(a),
+                Err(msg) => {
+                    self.entries.push(Entry::error(msg));
+                    self.auto_scroll = true;
+                }
+            }
+            return;
+        }
+
         let text = match self.editor.take() {
             Some(t) => t,
             None => return,
@@ -484,6 +524,7 @@ impl App {
                  /model  list available models\n\
                  /model <name>  change model\n\
                  /think  toggle thinking display\n\
+                 /yolo  toggle yolo mode (auto-approve tools)\n\
                  /exit or Ctrl+C  quit".into(),
             )),
             "/clear" | "/reset" => {
@@ -507,6 +548,15 @@ impl App {
                 self.cfg.show_thinking = !self.cfg.show_thinking;
                 let state = if self.cfg.show_thinking { "on" } else { "off" };
                 self.entries.push(Entry::info(format!("Thinking display: {state}")));
+            }
+            "/yolo" => {
+                self.cfg.yolo = !self.cfg.yolo;
+                let state = if self.cfg.yolo {
+                    "on (tools run without prompting)"
+                } else {
+                    "off (prompt before each tool call)"
+                };
+                self.entries.push(Entry::info(format!("Yolo mode: {state}")));
             }
             "/exit" | "/quit" => self.should_quit = true,
             "/model" | "/models" => self.list_models_entry(),
@@ -550,6 +600,25 @@ impl App {
         self.entries.push(Entry::info(text));
     }
 
+    // ── tool confirmation ─────────────────────────────────────────────────────
+
+    fn deliver_confirm(&mut self, action: ConfirmAction) {
+        let Some(p) = self.pending_confirm.take() else { return; };
+        let label = match &action {
+            ConfirmAction::Accept => "accepted".to_string(),
+            ConfirmAction::Reject(r) if r.is_empty() => "rejected".to_string(),
+            ConfirmAction::Reject(r) => format!("rejected: {r}"),
+            ConfirmAction::Modify(_) => "args modified".to_string(),
+            ConfirmAction::Comment(t) => format!("accepted + comment: {t}"),
+        };
+        self.entries.push(Entry::info(format!("→ {label}")));
+        self.auto_scroll = true;
+        if p.reply.send(action).is_err() {
+            self.entries
+                .push(Entry::error("worker gone — cannot deliver confirmation".into()));
+        }
+    }
+
     // ── worker events ─────────────────────────────────────────────────────────
 
     pub fn poll_worker(&mut self) {
@@ -590,6 +659,14 @@ impl App {
             }
             WorkerMsg::AddMessage(msg) => {
                 self.history.push(msg);
+            }
+            WorkerMsg::ConfirmRequest { name, args, reply } => {
+                let arg_str = fmt_args(&args);
+                self.entries.push(Entry::info(format!(
+                    "confirm tool: {name}  ({arg_str})\n[Enter]/y accept  n reject  c <note> comment  m <json> modify  Esc reject"
+                )));
+                self.pending_confirm = Some(PendingConfirm { name, args, reply });
+                self.auto_scroll = true;
             }
             WorkerMsg::Done => {
                 if !self.cfg.no_ctx { crate::context::save(&self.history); }
@@ -710,10 +787,16 @@ impl App {
     }
 
     fn render_input(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let (border_style, label_color) = (Style::default().fg(Color::Cyan), Color::Green);
+        let (border_style, label_color) = if self.pending_confirm.is_some() {
+            (Style::default().fg(Color::Yellow), Color::Yellow)
+        } else {
+            (Style::default().fg(Color::Cyan), Color::Green)
+        };
+
+        let prompt = if self.pending_confirm.is_some() { "? " } else { "> " };
 
         let content = Line::from(vec![
-            Span::styled("> ", Style::default().fg(label_color).add_modifier(Modifier::BOLD)),
+            Span::styled(prompt, Style::default().fg(label_color).add_modifier(Modifier::BOLD)),
             Span::raw(self.editor.input.clone()),
         ]);
 
@@ -725,20 +808,35 @@ impl App {
     }
 
     fn render_hints(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let hints = Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::Cyan)),
-            Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-            Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("^P/^N", Style::default().fg(Color::Cyan)),
-            Span::styled(" history  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Tab", Style::default().fg(Color::Cyan)),
-            Span::styled(" complete  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/help", Style::default().fg(Color::Cyan)),
-            Span::styled(" commands  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+C", Style::default().fg(Color::Cyan)),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-        ]);
+        let hints = if self.pending_confirm.is_some() {
+            Line::from(vec![
+                Span::styled("Enter/y", Style::default().fg(Color::Yellow)),
+                Span::styled(" accept  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("n", Style::default().fg(Color::Yellow)),
+                Span::styled(" reject  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("c <note>", Style::default().fg(Color::Yellow)),
+                Span::styled(" comment  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("m <json>", Style::default().fg(Color::Yellow)),
+                Span::styled(" modify  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled(" reject", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+                Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("^P/^N", Style::default().fg(Color::Cyan)),
+                Span::styled(" history  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Tab", Style::default().fg(Color::Cyan)),
+                Span::styled(" complete  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("/help", Style::default().fg(Color::Cyan)),
+                Span::styled(" commands  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+C", Style::default().fg(Color::Cyan)),
+                Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            ])
+        };
         f.render_widget(Paragraph::new(hints), area);
     }
 }
@@ -926,8 +1024,37 @@ fn run_worker(
         });
 
         match result {
-            Ok((content, Some(calls))) => {
-                // Add assistant message with tool calls to history
+            Ok((content, Some(mut calls))) => {
+                // Resolve confirmations up-front so the assistant message we
+                // store carries the final (possibly modified) arguments.
+                let mut actions: Vec<ConfirmAction> = Vec::with_capacity(calls.len());
+                for call in calls.iter_mut() {
+                    let action = if cfg.yolo {
+                        ConfirmAction::Accept
+                    } else {
+                        let (reply_tx, reply_rx) = mpsc::sync_channel::<ConfirmAction>(1);
+                        if tx
+                            .send(WorkerMsg::ConfirmRequest {
+                                name: call.function.name.clone(),
+                                args: call.function.arguments.clone(),
+                                reply: reply_tx,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        match reply_rx.recv() {
+                            Ok(a) => a,
+                            Err(_) => ConfirmAction::Reject("ui closed".into()),
+                        }
+                    };
+                    if let ConfirmAction::Modify(ref new_args) = action {
+                        call.function.arguments = new_args.clone();
+                    }
+                    actions.push(action);
+                }
+
+                // Add assistant message with (final) tool calls to history
                 let asst_msg = Message {
                     role: "assistant".to_string(),
                     content: content.clone(),
@@ -936,7 +1063,7 @@ fn run_worker(
                 history.push(asst_msg.clone());
                 let _ = tx.send(WorkerMsg::AddMessage(asst_msg));
 
-                for call in &calls {
+                for (call, action) in calls.iter().zip(actions.into_iter()) {
                     let name = &call.function.name;
                     let args = &call.function.arguments;
 
@@ -945,7 +1072,22 @@ fn run_worker(
                         args: args.clone(),
                     });
 
-                    let result_str = tools::execute(name, args);
+                    let (result_str, extra_user) = match action {
+                        ConfirmAction::Reject(reason) => {
+                            let msg = if reason.is_empty() {
+                                "Tool call rejected by user.".to_string()
+                            } else {
+                                format!("Tool call rejected by user: {reason}")
+                            };
+                            (msg, None)
+                        }
+                        ConfirmAction::Comment(text) => {
+                            (tools::execute(name, args), Some(text))
+                        }
+                        ConfirmAction::Accept | ConfirmAction::Modify(_) => {
+                            (tools::execute(name, args), None)
+                        }
+                    };
 
                     let preview: String = result_str
                         .lines()
@@ -963,6 +1105,16 @@ fn run_worker(
                     };
                     history.push(tool_msg.clone());
                     let _ = tx.send(WorkerMsg::AddMessage(tool_msg));
+
+                    if let Some(text) = extra_user {
+                        let user_msg = Message {
+                            role: "user".to_string(),
+                            content: text,
+                            tool_calls: None,
+                        };
+                        history.push(user_msg.clone());
+                        let _ = tx.send(WorkerMsg::AddMessage(user_msg));
+                    }
                 }
                 // Loop to get model's response after tool calls
             }
@@ -1082,6 +1234,90 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+/// Parse a confirmation input line into a ConfirmAction.
+/// Returns Err with a user-facing message on invalid input.
+fn parse_confirm_input(line: &str) -> Result<ConfirmAction, String> {
+    let t = line.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("y") || t.eq_ignore_ascii_case("yes") {
+        return Ok(ConfirmAction::Accept);
+    }
+    if t.eq_ignore_ascii_case("n") || t.eq_ignore_ascii_case("no") {
+        return Ok(ConfirmAction::Reject(String::new()));
+    }
+    let (head, rest) = match t.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim()),
+        None => (t, ""),
+    };
+    match head {
+        "r" | "reject" => Ok(ConfirmAction::Reject(rest.to_string())),
+        "c" | "comment" => {
+            if rest.is_empty() {
+                Err("comment requires text (e.g. `c please also lint`)".into())
+            } else {
+                Ok(ConfirmAction::Comment(rest.to_string()))
+            }
+        }
+        "m" | "modify" => {
+            if rest.is_empty() {
+                Err("modify requires JSON args (e.g. `m {\"path\":\"foo\"}`)".into())
+            } else {
+                serde_json::from_str::<Value>(rest)
+                    .map(ConfirmAction::Modify)
+                    .map_err(|e| format!("invalid JSON: {e}"))
+            }
+        }
+        _ => Err("unknown confirmation input; use y / n / c <note> / m <json>".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_empty_is_accept() {
+        assert!(matches!(parse_confirm_input(""), Ok(ConfirmAction::Accept)));
+        assert!(matches!(parse_confirm_input("  "), Ok(ConfirmAction::Accept)));
+        assert!(matches!(parse_confirm_input("y"), Ok(ConfirmAction::Accept)));
+        assert!(matches!(parse_confirm_input("YES"), Ok(ConfirmAction::Accept)));
+    }
+
+    #[test]
+    fn confirm_n_is_reject() {
+        assert!(matches!(parse_confirm_input("n"), Ok(ConfirmAction::Reject(r)) if r.is_empty()));
+        match parse_confirm_input("r unsafe path") {
+            Ok(ConfirmAction::Reject(r)) => assert_eq!(r, "unsafe path"),
+            _ => panic!("expected reject with reason"),
+        }
+    }
+
+    #[test]
+    fn confirm_comment_requires_text() {
+        assert!(parse_confirm_input("c").is_err());
+        match parse_confirm_input("c also lint afterwards") {
+            Ok(ConfirmAction::Comment(t)) => assert_eq!(t, "also lint afterwards"),
+            _ => panic!("expected comment"),
+        }
+    }
+
+    #[test]
+    fn confirm_modify_requires_valid_json() {
+        assert!(parse_confirm_input("m").is_err());
+        assert!(parse_confirm_input("m {not json}").is_err());
+        match parse_confirm_input(r#"m {"path":"x"}"#) {
+            Ok(ConfirmAction::Modify(v)) => {
+                assert_eq!(v.get("path").and_then(|x| x.as_str()), Some("x"));
+            }
+            _ => panic!("expected modify"),
+        }
+    }
+
+    #[test]
+    fn confirm_unknown_is_error() {
+        assert!(parse_confirm_input("garbage").is_err());
+    }
 }
 
 fn fmt_args(args: &Value) -> String {
