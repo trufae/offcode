@@ -4,6 +4,7 @@
 NAME    := offcode
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
 DIST    := dist
+BINDIR  ?= /usr/local/bin
 
 # ── native build ──────────────────────────────────────────────────────────────
 
@@ -84,8 +85,14 @@ dist: cross-all macos-universal
 
 .PHONY: install
 install: build
-	cp target/release/$(NAME) /usr/local/bin/$(NAME)
-	@echo "Installed $(NAME) to /usr/local/bin/$(NAME)"
+	cp target/release/$(NAME) $(BINDIR)/$(NAME)
+	@echo "Installed $(NAME) to $(BINDIR)/$(NAME)"
+
+.PHONY: symstall
+symstall: build
+	rm -f $(BINDIR)/$(NAME)
+	ln -sf $(CURDIR)/target/release/$(NAME) $(BINDIR)/$(NAME)
+	@echo "Symlinked $(BINDIR)/$(NAME) -> $(CURDIR)/target/release/$(NAME)"
 
 .PHONY: install-user
 install-user: build
@@ -98,7 +105,8 @@ help:
 	@echo "offcode build targets:"
 	@echo "  make build              Native release build"
 	@echo "  make run                Run in dev mode"
-	@echo "  make install            Install to /usr/local/bin"
+	@echo "  make install            Install to \$$(BINDIR) (default /usr/local/bin)"
+	@echo "  make symstall           Symlink binary into \$$(BINDIR) (rebuild-friendly)"
 	@echo "  make install-user       Install to ~/.local/bin"
 	@echo "  make cross-all          Cross-compile all targets (needs cross + Docker)"
 	@echo "  make x86_64-unknown-linux-musl   Linux x86_64 static"
