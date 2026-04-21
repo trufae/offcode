@@ -251,7 +251,7 @@ fn run_turn(cfg: &Config, client: &Client, messages: &mut Vec<Message>, input: &
                 let mut actions: Vec<ConfirmAction> = Vec::with_capacity(calls.len());
                 for call in calls.iter_mut() {
                     print_tool_call(&call.function.name, &call.function.arguments);
-                    let action = if cfg.yolo {
+                    let action = if cfg.is_auto_approved(&call.function.name) {
                         ConfirmAction::Accept
                     } else {
                         prompt_confirm_stdin()

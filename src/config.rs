@@ -13,11 +13,17 @@ pub struct Config {
     pub max_tool_iters: u32,
     #[serde(default = "default_yolo")]
     pub yolo: bool,
+    #[serde(default = "default_auto_approve")]
+    pub auto_approve_tools: Vec<String>,
     #[serde(skip)]
     pub no_ctx: bool,
 }
 
 fn default_yolo() -> bool { false }
+
+fn default_auto_approve() -> Vec<String> {
+    vec!["read_file".into(), "list_dir".into(), "search_files".into(), "path_info".into()]
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -41,6 +47,7 @@ impl Default for Config {
             show_thinking: false,
             max_tool_iters: 30,
             yolo: false,
+            auto_approve_tools: default_auto_approve(),
             no_ctx: false,
         }
     }
@@ -52,6 +59,10 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("offcode")
             .join("config.toml")
+    }
+
+    pub fn is_auto_approved(&self, tool_name: &str) -> bool {
+        self.yolo || self.auto_approve_tools.iter().any(|t| t == tool_name)
     }
 
     pub fn load() -> Self {

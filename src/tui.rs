@@ -1102,7 +1102,7 @@ fn run_worker(
                 // store carries the final (possibly modified) arguments.
                 let mut actions: Vec<ConfirmAction> = Vec::with_capacity(calls.len());
                 for call in calls.iter_mut() {
-                    let action = if cfg.yolo {
+                    let action = if cfg.is_auto_approved(&call.function.name) {
                         ConfirmAction::Accept
                     } else {
                         let (reply_tx, reply_rx) = mpsc::sync_channel::<ConfirmAction>(1);
